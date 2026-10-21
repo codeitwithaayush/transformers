@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 import warnings
 
 from ..models.auto.configuration_auto import AutoConfig
@@ -22,6 +23,7 @@ from ..utils.quantization_config import (
     AwqConfig,
     BitNetQuantConfig,
     BitsAndBytesConfig,
+    BlockScaledConfig,
     CompressedTensorsConfig,
     EetqConfig,
     FbgemmFp8Config,
@@ -150,6 +152,7 @@ LOADING_ATTRIBUTES_CONFIG_TYPES = (
     Mxfp4Config,
     MetalConfig,
     FineGrainedConfig,
+    BlockScaledConfig,
     FineGrainedFP8Config,
 )
 
@@ -275,7 +278,12 @@ class AutoHfQuantizer:
         ):
             loading_attr_dict = quantization_config_from_args.get_loading_attributes()
             for attr, val in loading_attr_dict.items():
+                if attr == "dtype_plan" and isinstance(quantization_config, FineGrainedConfig):
+                    val = _with_activation_formats(quantization_config.dtype_plan, val)
                 setattr(quantization_config, attr, val)
+            if isinstance(quantization_config, BlockScaledConfig):
+                # Check that the passed attributes are consistent with the checkpoint's
+                quantization_config.post_init()
 
             if loading_attr_dict:
                 warning_msg += f"However, loading attributes (e.g. {list(loading_attr_dict.keys())}) will be overwritten with the one you passed to `from_pretrained`. The rest will be ignored."
@@ -338,6 +346,21 @@ def register_quantizer(name: str):
         return cls
 
     return register_quantizer_fn
+
+
+def _with_activation_formats(dtype_plan: dict, passed_plan: dict) -> dict:
+    """Return `dtype_plan` with the activation formats of `passed_plan`.
+
+    An entry takes the passed activation format when the passed entry has the same pattern and format.
+    The weights stay the same. Only the kernels they run on change.
+    """
+    merged = dict(dtype_plan)
+    for pattern, entry in passed_plan.items():
+        if type(merged.get(pattern)) is type(entry):
+            merged[pattern] = copy.copy(merged[pattern])
+            merged[pattern].activation_format = entry.activation_format
+            merged[pattern].post_init()
+    return merged
 
 
 def get_hf_quantizer(config, quantization_config, device_map, weights_only, user_agent, gguf_file=None):

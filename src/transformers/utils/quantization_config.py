@@ -1709,6 +1709,123 @@ def _loading_attributes(config, **attributes) -> dict[str, Any]:
     return {**loading, **attributes}
 
 
+class BlockScaledConfig(QuantizationConfigMixin):
+    """Base config for the block-scaled weight formats.
+
+    It holds the format options, which the quantized modules read, and the loading options.
+    One such config quantizes a whole model. A [`FineGrainedConfig`] maps several of them onto parts of one model.
+    Build one of the formats.
+
+    Args:
+        activation_format (`str | None`, *optional*):
+            Activation format used by the quantized layers. `None` uses the weight format.
+        dequantize (`bool`, *optional*, defaults to `False`):
+            Whether to load a quantized checkpoint in full precision.
+        modules_to_not_convert (`list | None`, *optional*):
+            Module names or patterns to keep in full precision.
+        checkpoint_format (`str | None`, *optional*):
+            Producer layout of the checkpoint tensors: `"compressed-tensors"` or `"modelopt"`. It picks the key
+            names the formats load, e.g. `weight_scale` instead of `weight_scale_inv`.
+        prefer_deepgemm_linear (`bool`, *optional*, defaults to `True`):
+            Whether dense linears may run on DeepGEMM where it serves them, block FP8 before SM100. `False` always
+            runs the Triton kernels.
+    """
+
+    # The `quant_method` and the activation formats the kernels support
+    method: QuantizationMethod
+    activation_formats: tuple[str | None, ...] = (None,)
+    # Fixed by each format. Only FP8 takes them as options.
+    weight_block_size: tuple[int, int] | None = None
+    scale_fmt: str = "float"
+    activation_scheme: str = "dynamic"
+
+    def __init__(
+        self,
+        *,
+        activation_format: str | None = None,
+        dequantize: bool = False,
+        modules_to_not_convert: list | None = None,
+        checkpoint_format: str | None = None,
+        prefer_deepgemm_linear: bool = True,
+        **kwargs,
+    ):
+        if not hasattr(self, "method"):
+            raise TypeError(
+                f"{type(self).__name__} is what the block-scaled format configs share; build one of them: "
+                f"{', '.join(config.__name__ for config in BLOCK_SCALED_CONFIGS.values())}"
+            )
+        self.quant_method = self.method
+        kwargs.pop("quant_method", None)
+        if modules_to_not_convert is None and "ignored_layers" in kwargs:
+            modules_to_not_convert = kwargs.pop("ignored_layers")
+        # A `config.json` may spell out the fixed options, with the format's value or the shared default
+        fixed = {
+            name: kwargs.pop(name)
+            for name in ("weight_block_size", "scale_fmt", "activation_scheme")
+            if name in kwargs
+        }
+        changed = {
+            name: value
+            for name, value in fixed.items()
+            # `config.json` stores the block size as a list
+            if (tuple(value) if isinstance(value, list) else value)
+            not in (getattr(BlockScaledConfig, name), getattr(type(self), name))
+        }
+        if changed:
+            raise ValueError(
+                f"{self.method.value} weights fix {sorted(changed)} by their format; got {changed}. Only "
+                "`Fp8Config` sets them."
+            )
+        if kwargs:
+            logger.info(f"Unused kwargs: {list(kwargs)}. These kwargs are not used in {type(self).__name__}.")
+        self.checkpoint_format = checkpoint_format
+        self.activation_format = activation_format
+        self.dequantize = dequantize
+        self.modules_to_not_convert = modules_to_not_convert
+        self.prefer_deepgemm_linear = prefer_deepgemm_linear
+        self.post_init()
+
+    def post_init(self):
+        if self.activation_format not in self.activation_formats:
+            raise ValueError(
+                f"{self.method.value} weights take activation_format in {self.activation_formats}; "
+                f"got {self.activation_format!r}"
+            )
+        # Store the weight format's own activation format as `None`
+        if self.activation_format == self.method.value:
+            self.activation_format = None
+        if self.checkpoint_format not in (None, "compressed-tensors", "modelopt"):
+            raise ValueError(
+                f"checkpoint_format must be None, 'compressed-tensors' or 'modelopt'; got {self.checkpoint_format!r}"
+            )
+
+    def get_loading_attributes(self):
+        return _loading_attributes(
+            self, activation_format=self.activation_format, prefer_deepgemm_linear=self.prefer_deepgemm_linear
+        )
+
+    def _check_activation_format(self, activation_format: str | None):
+        """Raise if this checkpoint cannot run with the `activation_format` passed to `from_pretrained`."""
+        # first overridden by `NVFP4Config` in #49779, which rejects weight-only checkpoints
+
+    def loading_attributes_lender(self, config):
+        # A `FineGrainedConfig` lends to a single-format checkpoint if its plan is empty or holds only that format.
+        # The plan entry then also lends its activation format.
+        if not isinstance(config, FineGrainedConfig):
+            return super().loading_attributes_lender(config)
+        entries = list(config.dtype_plan.values())
+        if len(entries) > 1 or any(type(entry) is not type(self) for entry in entries):
+            return None
+        lender = copy.copy(entries[0] if entries else self)
+        lender.dequantize, lender.modules_to_not_convert = config.dequantize, config.modules_to_not_convert
+        return lender
+
+
+# Block-scaled format configs by `quant_method`, to read plan entries back from `config.json`
+# the formats register here in #49777 to #49780, the tests patch in test-only formats
+BLOCK_SCALED_CONFIGS: dict[str, type[BlockScaledConfig]] = {}
+
+
 class FineGrainedConfig(QuantizationConfigMixin):
     """
     Configuration for a model whose modules use different quantization methods.
@@ -1721,6 +1838,8 @@ class FineGrainedConfig(QuantizationConfigMixin):
             Maps a module regex to the config of the modules it matches. A targeted entry wins over the
             `".*"` catch-all. Modules that no entry covers stay in full precision. Entries take no loading options.
             Set `dequantize` and `modules_to_not_convert` on this config instead.
+            On a pre-quantized checkpoint, a passed plan only overrides the activation formats of the checkpoint's
+            entries with the same pattern.
         modules_to_not_convert (`list`, *optional*):
             Modules to keep in full precision.
         dequantize (`bool`, *optional*, defaults to `False`):
@@ -1782,13 +1901,17 @@ class FineGrainedConfig(QuantizationConfigMixin):
         }
 
     def get_loading_attributes(self):
-        return _loading_attributes(self)
+        return _loading_attributes(self, **({"dtype_plan": self.dtype_plan} if self.dtype_plan else {}))
 
     def loading_attributes_lender(self, config):
-        # The config of a plan entry's method lends its loading options to the plan
+        # The config of a plan entry's method lends its loading options to the plan.
+        # It lends its activation format to the plan entries of the same format.
         if not any(type(entry) is type(config) for entry in self.dtype_plan.values()):
             return super().loading_attributes_lender(config)
+        entry = copy.copy(config)
+        entry.dequantize, entry.modules_to_not_convert = False, None
         return FineGrainedConfig(
+            dtype_plan={pattern: entry for pattern, own in self.dtype_plan.items() if type(own) is type(config)},
             modules_to_not_convert=getattr(config, "modules_to_not_convert", None),
             dequantize=getattr(config, "dequantize", False),
         )
